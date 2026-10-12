@@ -19,19 +19,27 @@ CONTINUE_WIDTH = (0.07, 0.14)
 # this column but are ~45px wide, so the width range filters them out.
 BATTLE_AREA = (0.64, 0.1, 0.81, 0.95)
 BATTLE_WIDTH = (0.08, 0.14)
-# PLAY AGAIN: 105x19 at x 515-620, y 348-367 on the run complete popup, never moves.
-PLAY_AGAIN_AREA = (0.49, 0.58, 0.62, 0.66)
+# Run complete popup, two layouts; its height depends on the loot list:
+#   RETURN TO CASTLE | PLAY AGAIN (x 515-620)
+#   RETURN TO CASTLE | PLAY AGAIN (x 464-560) | NEXT (x 564-660, tan too)
+# CONTINUE is a single tan button centered at x 512, so the run complete row is the one with
+# two tan buttons or one right of center. x 540 is on PLAY AGAIN in both layouts.
+PLAY_AGAIN_AREA = (0.44, 0.45, 0.66, 0.85)
 PLAY_AGAIN_WIDTH = (0.08, 0.12)
+PLAY_AGAIN_X = 540 / 1024
+OFF_CENTER_X = 530 / 1024
+SAME_ROW = 6 / 576
 
 
-def find_button(frame, area, width_range):
-    """Return (x, y) center of the first solid tan button in area, or None."""
+def find_buttons(frame, area, width_range):
+    """Return (x, y) centers of all solid tan buttons in area."""
     h, w = frame.shape[:2]
     x0, y0 = int(area[0] * w), int(area[1] * h)
     x1, y1 = int(area[2] * w), int(area[3] * h)
     hsv = cv2.cvtColor(frame[y0:y1, x0:x1], cv2.COLOR_BGR2HSV)
     mask = cv2.inRange(hsv, TAN_LOW, TAN_HIGH)
 
+    found = []
     n, _, stats, _ = cv2.connectedComponentsWithStats(mask)
     for i in range(1, n):
         x, y, bw, bh, px = stats[i]
@@ -41,8 +49,14 @@ def find_button(frame, area, width_range):
             continue
         if px / (bw * bh) < MIN_FILL:
             continue
-        return int(x0 + x + bw // 2), int(y0 + y + bh // 2)
-    return None
+        found.append((int(x0 + x + bw // 2), int(y0 + y + bh // 2)))
+    return found
+
+
+def find_button(frame, area, width_range):
+    """Return (x, y) center of the first solid tan button in area, or None."""
+    found = find_buttons(frame, area, width_range)
+    return found[0] if found else None
 
 
 def find_continue(frame):
@@ -54,7 +68,13 @@ def find_battle(frame):
 
 
 def find_play_again(frame):
-    return find_button(frame, PLAY_AGAIN_AREA, PLAY_AGAIN_WIDTH)
+    h, w = frame.shape[:2]
+    found = find_buttons(frame, PLAY_AGAIN_AREA, PLAY_AGAIN_WIDTH)
+    for cx, cy in found:
+        row = [x for x, y in found if abs(y - cy) <= SAME_ROW * h]
+        if len(row) >= 2 or cx > OFF_CENTER_X * w:
+            return int(PLAY_AGAIN_X * w), cy
+    return None
 
 
 def main():

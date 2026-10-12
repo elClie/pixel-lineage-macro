@@ -4,7 +4,7 @@ import sys
 import cv2
 import numpy as np
 
-from sell import color_cover
+from sell import TAN_RANGES, color_cover
 from stage_select import grab_screen
 
 # Battle action menu (bottom left), measured on 1024x576 and stored as fractions.
@@ -23,6 +23,20 @@ MIN_COVER = 0.6
 
 # Highlighted row background is ~20 brighter than the rest.
 MIN_HIGHLIGHT_GAP = 10
+
+# Bottom HUD, up for the whole battle in every layout (menu, skill list, minigame battle log).
+# Top-right of the big middle panel is plain navy; stage select cards are navy there too, so the
+# left border of the PARTY/FOES panel is required as well.
+HUD_AREA = (642 / 1024, 416 / 576, 754 / 1024, 474 / 576)
+HUD_EDGE_BOX = (762 / 1024, 420 / 576, 775 / 1024, 500 / 576)
+HUD_MIN_COVER = 0.7
+
+# Skill list popup (opened from SKILLS) and the BACK button that only exists while it's open.
+BACK_BTN = (138 / 1024, 427 / 576)
+# Thin lines: each box must contain one column (border) / row (BACK edge) that's mostly line-colored.
+SKILL_LIST_BORDER_BOX = (179 / 1024, 255 / 576, 190 / 1024, 385 / 576)  # left edge of the list
+BACK_EDGE_BOX = (110 / 1024, 431 / 576, 166 / 1024, 442 / 576)  # bottom edge of BACK's tan outline
+LINE_COVER = 0.8
 
 
 def row_y(frame, i):
@@ -54,6 +68,36 @@ def menu_visible(frame):
     )
 
 
+def line_cover(frame, box, ranges, vertical):
+    """Best fraction of line-colored pixels over the columns (vertical) or rows of box."""
+    h, w = frame.shape[:2]
+    x0, y0, x1, y1 = int(box[0] * w), int(box[1] * h), int(box[2] * w), int(box[3] * h)
+    hsv = cv2.cvtColor(frame[y0:y1, x0:x1], cv2.COLOR_BGR2HSV)
+    mask = np.zeros(hsv.shape[:2], bool)
+    for lo, hi in ranges:
+        mask |= cv2.inRange(hsv, lo, hi) > 0
+    return float(mask.mean(axis=0 if vertical else 1).max())
+
+
+def hud_visible(frame):
+    return (
+        color_cover(frame, HUD_AREA, BODY_RANGE) >= HUD_MIN_COVER
+        and line_cover(frame, HUD_EDGE_BOX, BORDER_RANGE, vertical=True) >= LINE_COVER
+    )
+
+
+def skill_list_open(frame):
+    return (
+        line_cover(frame, SKILL_LIST_BORDER_BOX, BORDER_RANGE, vertical=True) >= LINE_COVER
+        and line_cover(frame, BACK_EDGE_BOX, TAN_RANGES, vertical=False) >= LINE_COVER
+    )
+
+
+def to_px(frame, pt):
+    h, w = frame.shape[:2]
+    return int(pt[0] * w), int(pt[1] * h)
+
+
 def main():
     parser = argparse.ArgumentParser(description="Check battle menu detection")
     parser.add_argument("image", nargs="?", help="screenshot to analyze (default: live screen)")
@@ -64,6 +108,8 @@ def main():
         sys.exit(f"Can't read {args.image}")
     print(f"menu visible: {menu_visible(frame)}")
     print(f"highlighted:  {highlighted_row(frame)}")
+    print(f"skill list:   {skill_list_open(frame)}")
+    print(f"HUD:          {hud_visible(frame)}")
 
 
 if __name__ == "__main__":

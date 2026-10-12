@@ -3,12 +3,14 @@ import threading
 import time
 
 import pydirectinput
-from pynput import keyboard
 
-from battle import ROWS, highlighted_row, menu_visible, row_px
+from battle import ROWS, highlighted_row, hud_visible, menu_visible, row_px
 from buttons import find_battle, find_continue, find_play_again
+from hotkeys import running, start_listener, stopping, wait
 from macro import click
+from minigame import MinigameSolver, solve_loop
 from sell import CLOSE_BTN, gear_ready, menu_open, run_sell, to_px
+from skills import SkillBattle
 from stage_select import grab_screen, pick_stage
 
 SCAN_INTERVAL = 0.1
@@ -21,6 +23,7 @@ CONFIRM_DELAY = 0.3
 # The stage select can linger while the next screen loads; don't pick a card again in that window.
 CARD_REPICK_DELAY = 3.0
 SPACE_INTERVAL = 0.1
+AUTO_SELL = False
 # Sell gear after this many PLAY AGAIN clicks, once the GEAR button is usable.
 SELL_EVERY = 1
 SELL_RETRY_DELAY = 5.0
@@ -29,6 +32,16 @@ GUARD_AFTER = 2.0
 # Next battle after a GUARD: menu must be up this long before moving the pointer.
 MENU_LOAD_DELAY = 0.5
 KEY_SETTLE = 0.3
+# HUD must have been up this long for its disappearance to count as a battle ending.
+HUD_MIN = 1.0
+# Post-battle Space spam gives up after this long if neither CONTINUE nor a stage select shows up.
+POST_BATTLE_SPAM = 30.0
+# Faster scans while spamming, so few Spaces land on the stage select before the spam stops.
+POST_BATTLE_SCAN = 0.02
+# Outside battle, no click/key for this long means something is stuck: click an empty corner.
+IDLE_CLICK_AFTER = 20.0
+# Bottom-right edge: empty ground on stage select, shop, popups and run complete.
+IDLE_CLICK_POS = (1014 / 1024, 570 / 576)
 
 # PLAY AGAIN first: its popup also passes the CONTINUE size/position check.
 BUTTONS = (
@@ -36,40 +49,21 @@ BUTTONS = (
     ("continue", find_continue),
     ("battle", find_battle),
 )
+# Every stage select opens with CONTINUE or straight on the cards; PLAY AGAIN if the run ended.
+POST_BATTLE_ENDS = (
+    ("CONTINUE", find_continue),
+    ("PLAY AGAIN", find_play_again),
+    ("stage", pick_stage),
+)
 
-# Virtual key codes for the top-row 2 and 3. Matched by vk because holding Ctrl
-# turns the key's char into a control code.
-VK_START, VK_STOP = 0x32, 0x33
-CTRL_KEYS = {keyboard.Key.ctrl, keyboard.Key.ctrl_l, keyboard.Key.ctrl_r}
-
-running = threading.Event()
-stopping = threading.Event()
 # Space could press things inside the gear menu, so spamming pauses while this is set.
 selling = threading.Event()
 # Set after a battle where GUARD was clicked: the pointer is left on GUARD, so Space stays
 # paused until the next battle's pointer is moved back to SCROLL.
 fixing_pointer = threading.Event()
-ctrl_held = set()
-
-
-def on_press(key):
-    if key in CTRL_KEYS:
-        ctrl_held.add(key)
-        return
-    if not ctrl_held:
-        return
-    vk = getattr(key, "vk", None)
-    if vk == VK_START and not running.is_set():
-        running.set()
-        print("[started]")
-    elif vk == VK_STOP:
-        stopping.set()
-        print("[stopping]")
-        return False
-
-
-def on_release(key):
-    ctrl_held.discard(key)
+# Set from the HUD vanishing until a popup button / stage select appears: Space skips the
+# victory screens faster than waiting for CONTINUE. Overrides fixing_pointer (no menu there).
+post_battle = threading.Event()
 
 
 def find_any_button(frame):
@@ -80,14 +74,10 @@ def find_any_button(frame):
     return None
 
 
-def wait(seconds):
-    """Sleep, but return early (True) if Ctrl+3 was pressed."""
-    return stopping.wait(seconds)
-
-
-def spam_space():
+def spam_space(always):
     while not stopping.is_set():
-        if not running.is_set() or selling.is_set() or fixing_pointer.is_set():
+        active = post_battle.is_set() or (always and not fixing_pointer.is_set())
+        if not running.is_set() or selling.is_set() or not active:
             wait(0.1)
             continue
         try:
@@ -116,23 +106,38 @@ def main():
     parser = argparse.ArgumentParser(description="Clicks popup buttons and picks the best stage")
     parser.add_argument("--dry-run", action="store_true", help="log actions without clicking")
     parser.add_argument("--sell-test", action="store_true", help="run the gear sell routine once, then exit")
+    parser.add_argument("--skills", action="store_true",
+                        help="skill mode: cast skills then ATTACK each battle, auto-play minigames, "
+                             "Space spam only after battles")
     args = parser.parse_args()
 
+    last_activity = time.time()
+
     def do_click(pos):
+        nonlocal last_activity
+        last_activity = time.time()
         if not args.dry_run and not stopping.is_set():
             click(*pos, "left")
 
     def do_key(key):
+        nonlocal last_activity
+        last_activity = time.time()
         if not args.dry_run and not stopping.is_set():
             pydirectinput.press(key)
 
-    keyboard.Listener(on_press=on_press, on_release=on_release, daemon=True).start()
+    start_listener()
     if args.sell_test:
         sell_test(do_click)
         return
+    skill_battle = None
+    if args.skills:
+        solver = MinigameSolver()
+        threading.Thread(target=solve_loop, args=(solver, args.dry_run), daemon=True).start()
+        skill_battle = SkillBattle(do_key, do_click, grab_screen, wait, lambda: solver.last_seen)
     if not args.dry_run:
-        threading.Thread(target=spam_space, daemon=True).start()
-    print("Ctrl+2 = start, Ctrl+3 = stop." + (" [dry run]" if args.dry_run else ""))
+        threading.Thread(target=spam_space, args=(not args.skills,), daemon=True).start()
+    print(("[skill mode] " if args.skills else "") + "Ctrl+2 = start, Ctrl+3 = stop."
+          + (" [dry run]" if args.dry_run else ""))
 
     last_button = 0.0
     last_card = 0.0
@@ -140,9 +145,13 @@ def main():
     last_sell_try = 0.0
     menu_since = None
     guarded = False
+    hud_since = None
+    post_battle_until = 0.0
 
     def left_battle():
         nonlocal guarded
+        if skill_battle:
+            skill_battle.new_battle()
         if guarded:
             guarded = False
             fixing_pointer.set()
@@ -150,6 +159,7 @@ def main():
 
     while not stopping.is_set():
         if not running.is_set():
+            last_activity = time.time()
             wait(0.1)
             continue
 
@@ -162,7 +172,51 @@ def main():
             wait(CLICK_COOLDOWN)
             continue
 
-        if menu_visible(frame):
+        now = time.time()
+        hud = hud_visible(frame)
+        if hud:
+            last_activity = now
+        elif now - last_activity >= IDLE_CLICK_AFTER:
+            pos = to_px(frame, IDLE_CLICK_POS)
+            print(f"[idle] nothing happened for {IDLE_CLICK_AFTER:.0f}s, click corner {pos}")
+            do_click(pos)
+            continue
+
+        if hud:
+            hud_since = hud_since or now
+            if post_battle.is_set():
+                post_battle.clear()
+                print("[battle] HUD back, post-battle Space off")
+        else:
+            if hud_since and now - hud_since >= HUD_MIN:
+                print("[battle] HUD gone, battle over: spamming Space")
+                left_battle()
+                post_battle_until = now + POST_BATTLE_SPAM
+                post_battle.set()
+            hud_since = None
+            if post_battle.is_set():
+                # Anything before these (boss chest cutscene etc.) is only skipped, never clicked.
+                found = None
+                for name, finder in POST_BATTLE_ENDS:
+                    hit = finder(frame)
+                    if hit:
+                        found = f"{name} {hit}"
+                        break
+                if found:
+                    post_battle.clear()
+                    print(f"[battle] post-battle Space off, found {found}")
+                elif now > post_battle_until:
+                    post_battle.clear()
+                    print(f"[battle] no CONTINUE/stage after {POST_BATTLE_SPAM:.0f}s, Space off")
+                else:
+                    wait(POST_BATTLE_SCAN)
+                    continue
+
+        if skill_battle:
+            if skill_battle.step(frame):
+                wait(0.05)
+                continue
+        elif menu_visible(frame):
             now = time.time()
             menu_since = menu_since or now
             shown = now - menu_since
@@ -209,7 +263,12 @@ def main():
             wait(SCAN_INTERVAL)
             continue
 
-        if play_agains >= SELL_EVERY and gear_ready(frame) and now - last_sell_try >= SELL_RETRY_DELAY:
+        if (
+            AUTO_SELL
+            and play_agains >= SELL_EVERY
+            and gear_ready(frame)
+            and now - last_sell_try >= SELL_RETRY_DELAY
+        ):
             if args.dry_run:
                 print("[sell] would sell gear now")
                 ok = True
