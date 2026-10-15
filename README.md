@@ -1,5 +1,5 @@
 # pixel-lineage-macro
-
+# this is a very early prototype, no stable release exist
 A screen-reading macro that plays a 2D Roblox roguelike RPG on its own. It watches the screen, decides what's showing, and clicks buttons, picks stages, sells gear, and taps Space to fight.
 
 Windows only. It assumes the game runs fullscreen on the primary monitor.
